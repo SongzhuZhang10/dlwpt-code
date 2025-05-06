@@ -63,7 +63,8 @@ class LunaModel(nn.Module):
 
         return linear_output, self.head_softmax(linear_output)
 
-
+# in_channels: number of channels in the input data.
+# conv_channels: number of channels you want the convolutional layers to output (i.e., number of features you want the block to detect).
 class LunaBlock(nn.Module):
     def __init__(self, in_channels, conv_channels):
         super().__init__()

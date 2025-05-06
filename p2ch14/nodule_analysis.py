@@ -330,16 +330,23 @@ class NoduleAnalysisApp:
             classifications_list = self.classifyCandidates(
                 ct, candidateInfo_list)
 
+            """
+            If our threshold was 0.3 instead of 0.5, we would pres- ent a few more candidates
+            that turn out not to be nodules, while reducing the risk of missing actual nodules.
+            """
             if not self.cli_args.run_validation:
                 print(f"found nodule candidates in {series_uid}:")
                 for prob, prob_mal, center_xyz, center_irc in classifications_list:
+                    # For all candidates found by the segmentation where the classifier assigned
+                    # a nodule probability of 50% or more
                     if prob > 0.5:
                         s = f"nodule prob {prob:.3f}, "
                         if self.malignancy_model:
                             s += f"malignancy prob {prob_mal:.3f}, "
                         s += f"center xyz {center_xyz}"
                         print(s)
-
+            # If we have the ground truth data, we compute and print the confusion matrix and
+            # also add the current results to the total.
             if series_uid in candidateInfo_dict:
                 one_confusion = match_and_score(
                     classifications_list, candidateInfo_dict[series_uid]
@@ -355,13 +362,15 @@ class NoduleAnalysisApp:
 
 
     def classifyCandidates(self, ct, candidateInfo_list):
+        # Get a data loader to loop over the candidate list
         cls_dl = self.initClassificationDl(candidateInfo_list)
         classifications_list = []
         for batch_ndx, batch_tup in enumerate(cls_dl):
             input_t, _, _, series_list, center_list = batch_tup
-
+            # Send the inputs to the device
             input_g = input_t.to(self.device)
             with torch.no_grad():
+                # Run the inputs through the nodule vs. non-nodule network
                 _, probability_nodule_g = self.cls_model(input_g)
                 if self.malignancy_model is not None:
                     _, probability_mal_g = self.malignancy_model(input_g)
@@ -371,6 +380,7 @@ class NoduleAnalysisApp:
             zip_iter = zip(center_list,
                 probability_nodule_g[:,1].tolist(),
                 probability_mal_g[:,1].tolist())
+            # Do the bookkeeping by constructing a list of the results
             for center_irc, prob_nodule, prob_mal in zip_iter:
                 center_xyz = irc2xyz(center_irc,
                     direction_a=ct.direction_a,
@@ -383,16 +393,34 @@ class NoduleAnalysisApp:
 
     def segmentCt(self, ct, series_uid):
         with torch.no_grad():
+            # Get a NumPy array of the same shape as the CT scan filled with zeros.
+            # It will hold floating-point probability predictions for each slice.
             output_a = np.zeros_like(ct.hu_a, dtype=np.float32)
-            seg_dl = self.initSegmentationDl(series_uid)  #  <3>
+            # Initialize a data loader that returns batches of CT slices.
+            seg_dl = self.initSegmentationDl(series_uid)
+            """
+            Each entry slice_ndx_list[i] is the slice-number in the full 3D scan
+            that was used as the central slice for the i-th sample in the batch.
+            This list of central slices enables us to reconstruct the full 3D
+            probability map (output_a) by placing each 2D prediction back into
+            the correct z-position of the CT volume. Without these indices, we
+            wouldn’t know where each slice’s prediction belongs in the overall scan.
+            """
             for input_t, _, _, slice_ndx_list in seg_dl:
 
+                # Transfer the batch of input slices to the GPU
                 input_g = input_t.to(self.device)
+                # Run the segmentation model on the batch.
                 prediction_g = self.seg_model(input_g)
 
+                # Reconstruct the 3D volume one slice at a time
                 for i, slice_ndx in enumerate(slice_ndx_list):
+                    # Move the prediction tensor from GPU to CPU because NumPy arrays
+                    # can only be created from CPU memory.
                     output_a[slice_ndx] = prediction_g[i].cpu().numpy()
 
+            # Thresholds the probability outputs to get a binary output, and then
+            # applies binary erosion as cleanup
             mask_a = output_a > 0.5
             mask_a = morphology.binary_erosion(mask_a, iterations=1)
 
@@ -400,6 +428,7 @@ class NoduleAnalysisApp:
 
     def groupSegmentationOutput(self, series_uid,  ct, clean_a):
         candidateLabel_a, candidate_count = measurements.label(clean_a)
+        # Get the center of mass for each group as index, row, column coordinates
         centerIrc_list = measurements.center_of_mass(
             ct.hu_a.clip(-1000, 1000) + 1001,
             labels=candidateLabel_a,
@@ -408,6 +437,7 @@ class NoduleAnalysisApp:
 
         candidateInfo_list = []
         for i, center_irc in enumerate(centerIrc_list):
+            # Converts the voxel coordinates to real patient coordinates
             center_xyz = irc2xyz(
                 center_irc,
                 ct.origin_xyz,
@@ -416,6 +446,7 @@ class NoduleAnalysisApp:
             )
             assert np.all(np.isfinite(center_irc)), repr(['irc', center_irc, i, candidate_count])
             assert np.all(np.isfinite(center_xyz)), repr(['xyz', center_xyz])
+            # Builds our candidate info tuple and appends it to the list of detections
             candidateInfo_tup = \
                 CandidateInfoTuple(False, False, False, 0.0, series_uid, center_xyz)
             candidateInfo_list.append(candidateInfo_tup)

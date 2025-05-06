@@ -34,10 +34,9 @@ CandidateInfoTuple = namedtuple('CandidateInfoTuple', 'isNodule_bool, hasAnnotat
 
 @functools.lru_cache(1)
 def getCandidateInfoList(requireOnDisk_bool=True):
-    # We construct a set with all series_uids that are present on disk.
-    # This will let us use the data, even if we haven't downloaded all of
-    # the subsets yet.
+    # Get a list of all file paths that match the pattern.
     mhd_list = glob.glob('data-unversioned/part2/luna/subset*/*.mhd')
+    # os.path.split(p) splits the path into (directory, filename) tuple.
     presentOnDisk_set = {os.path.split(p)[-1][:-4] for p in mhd_list}
 
     candidateInfo_list = []
@@ -50,8 +49,8 @@ def getCandidateInfoList(requireOnDisk_bool=True):
 
             candidateInfo_list.append(
                 CandidateInfoTuple(
-                    True,
-                    True,
+                    True, # isNodule_bool
+                    True, # hasAnnotation_bool
                     isMal_bool,
                     annotationDiameter_mm,
                     series_uid,
@@ -72,9 +71,9 @@ def getCandidateInfoList(requireOnDisk_bool=True):
             if not isNodule_bool:
                 candidateInfo_list.append(
                     CandidateInfoTuple(
-                        False,
-                        False,
-                        False,
+                        False, # isNodule_bool
+                        False, # hasAnnotation_bool
+                        False, # isMal_bool
                         0.0,
                         series_uid,
                         candidateCenter_xyz,
@@ -84,6 +83,7 @@ def getCandidateInfoList(requireOnDisk_bool=True):
     candidateInfo_list.sort(reverse=True)
     return candidateInfo_list
 
+# This can be useful to keep Ct init from being a performance bottleneck.
 @functools.lru_cache(1)
 def getCandidateInfoDict(requireOnDisk_bool=True):
     candidateInfo_list = getCandidateInfoList(requireOnDisk_bool)
@@ -115,18 +115,41 @@ class Ct:
 
         candidateInfo_list = getCandidateInfoDict()[self.series_uid]
 
+        # This list is used to build the annotation mask. 
         self.positiveInfo_list = [
             candidate_tup
             for candidate_tup in candidateInfo_list
-            if candidate_tup.isNodule_bool
+            if candidate_tup.isNodule_bool # Filter the candidates into a list containing only nodules
         ]
-        self.positive_mask = self.buildAnnotationMask(self.positiveInfo_list)
-        self.positive_indexes = (self.positive_mask.sum(axis=(1,2))
-                                 .nonzero()[0].tolist())
+        self.positive_mask = self.buildAnnotationMask(self.positiveInfo_list) # shape: (depth, height, width)
+        
+        """
+        .sum(axis=(1,2)) performs a sum over the height and width dimensions for each slice. For each slice (depth index),
+        it adds up the True values in that 2D plane. It gives a 1D array of shape (depth,), where each element tells how many
+        positive (nodule) voxels are present in that slice.
+        .nonzero() identifies the indices in that 1D array where the value is non-zero. It returns a tuple of arrays.
+        [0] extracts the actual NumPy array of indices from the tuple.
+        .tolist() converts the NumPy array to a Python list.
+        self.positive_indexes is a list of slice indices where nodules are found. 
+        """
+        self.positive_indexes = (self.positive_mask.sum(axis=(1,2)).nonzero()[0].tolist())
 
+    """
+    The purpose of this method is to create a 3D binary mask indicating the presence of positive annotations (nodules)
+    in the CT volume. Each "positive" region (where a nodule exists) is estimated by:
+        Converting the nodule center from real-world coordinates to voxel (IRC) coordinates.
+        Estimating a bounding box around that center where HU values are above a threshold.
+        Filling the corresponding region in the bounding box with True.
+    """
     def buildAnnotationMask(self, positiveInfo_list, threshold_hu = -700):
+        """
+        self.hu_a is a 3D NumPy array representing a CT scan volume in Hounsfield Units (HU).
+        Create a NumPy array of the same shape and type as self.hu_a but filled with zeros.
+        dtype=np.bool overrides the data type to boolean which means all elements are False.
+        """
         boundingBox_a = np.zeros_like(self.hu_a, dtype=np.bool)
 
+        # Loops over the nodules.
         for candidateInfo_tup in positiveInfo_list:
             center_irc = xyz2irc(
                 candidateInfo_tup.center_xyz,
@@ -134,10 +157,13 @@ class Ct:
                 self.vxSize_xyz,
                 self.direction_a,
             )
+
+            # Gets the center voxel indices
             ci = int(center_irc.index)
             cr = int(center_irc.row)
             cc = int(center_irc.col)
 
+            # Radius defines how far to expand in each direction from the center.
             index_radius = 2
             try:
                 while self.hu_a[ci + index_radius, cr, cc] > threshold_hu and \
@@ -165,12 +191,20 @@ class Ct:
             # assert index_radius > 0, repr([candidateInfo_tup.center_xyz, center_irc, self.hu_a[ci, cr, cc]])
             # assert row_radius > 0
             # assert col_radius > 0
-
+            """
+            Set a 3D cuboid in the array to True, marking that space as containing part of a candidate nodule.
+            The +1 ensures that the end index is inclusive, since Python slicing is end-exclusive.
+            This cuboid serves as an initial estimate of the annotated nodule volume.
+            """
             boundingBox_a[
                  ci - index_radius: ci + index_radius + 1,
                  cr - row_radius: cr + row_radius + 1,
                  cc - col_radius: cc + col_radius + 1] = True
-
+        """
+        (self.hu_a > threshold_hu) is a boolean array that acts as a density filter to isolate solid structures
+        (e.g. tumors) within the CT scan volume.
+        mask_a is a refined binary mask that represents the 'real' parts of a nodule candidate within the bounding box.
+        """
         mask_a = boundingBox_a & (self.hu_a > threshold_hu)
 
         return mask_a
@@ -220,6 +254,8 @@ def getCtRawCandidate(series_uid, center_xyz, width_irc):
 @raw_cache.memoize(typed=True)
 def getCtSampleSize(series_uid):
     ct = Ct(series_uid)
+    #  ct.hu_a.shape[0] is the number of slices in the CT scan (along the top-to-bottom axis).
+    #  ct.positive_indexes is a list of slice indexes that contain nodules.
     return int(ct.hu_a.shape[0]), ct.positive_indexes
 
 
@@ -232,23 +268,31 @@ class Luna2dSegmentationDataset(Dataset):
                  fullCt_bool=False,
             ):
         self.contextSlices_count = contextSlices_count
+        
+        # In full scan mode (fullCt_bool=True), all slices of the CT scan are included.
         self.fullCt_bool = fullCt_bool
 
+        # Check if the user provided a specific series uid which allows using the dataset for just one CT scan.
         if series_uid:
+            # Store the single series uid inside a list.
             self.series_list = [series_uid]
         else:
+            # Store the series uids of all available CT scan series.
             self.series_list = sorted(getCandidateInfoDict().keys())
 
         if isValSet_bool:
             assert val_stride > 0, val_stride
+            # Keep only every val_stride-th element, starting with 0.
             self.series_list = self.series_list[::val_stride]
             assert self.series_list
         elif val_stride > 0:
+            # When training, we delete every val_stride-th element.
             del self.series_list[::val_stride]
             assert self.series_list
 
         self.sample_list = []
         for series_uid in self.series_list:
+            # index_count = number of slices in a CT scan
             index_count, positive_indexes = getCtSampleSize(series_uid)
 
             if self.fullCt_bool:
@@ -260,10 +304,19 @@ class Luna2dSegmentationDataset(Dataset):
 
         self.candidateInfo_list = getCandidateInfoList()
 
+        """
+        We convert the list into a set to:
+            1. automatically remove duplicates
+            2. speedup membership checking in later steps
+        """
         series_set = set(self.series_list)
+        
+        # Check membership in a set takes O(1).
+        # Filter out candidates with series UID that are absent in the series set.
         self.candidateInfo_list = [cit for cit in self.candidateInfo_list
                                    if cit.series_uid in series_set]
 
+        # Get a list of actual nodules
         self.pos_list = [nt for nt in self.candidateInfo_list
                             if nt.isNodule_bool]
 
@@ -279,24 +332,39 @@ class Luna2dSegmentationDataset(Dataset):
         return len(self.sample_list)
 
     def __getitem__(self, ndx):
+        # Wrap the index around into the sample list in order to decouple the epoch size
+        # (given by the length of the dataset) from the actual number of samples.
         series_uid, slice_ndx = self.sample_list[ndx % len(self.sample_list)]
         return self.getitem_fullSlice(series_uid, slice_ndx)
 
+    # Get the entire slice of data for the given series uid and slice index
     def getitem_fullSlice(self, series_uid, slice_ndx):
         ct = getCt(series_uid)
+        """
+        self.contextSlices_count * 2 + 1 calculates the number of slices that will be included
+        in the tensor ct_t.
+        contextSlices_count determines how many context slices (slices before or after the current slice) are considered.
+        contextSlices_count * 2 is the total number of context slices before and after the current slice.
+        +1 to include the current slice itself.
+        """
         ct_t = torch.zeros((self.contextSlices_count * 2 + 1, 512, 512))
 
         start_ndx = slice_ndx - self.contextSlices_count
         end_ndx = slice_ndx + self.contextSlices_count + 1
         for i, context_ndx in enumerate(range(start_ndx, end_ndx)):
+            # Ensure the current slice index is in the valid range for the very first and last slice.
             context_ndx = max(context_ndx, 0)
             context_ndx = min(context_ndx, ct.hu_a.shape[0] - 1)
+            # Convert the NumPy array to a PyTorch tensor with float32 format and
+            # then assigns it to the i-th slice in the CT tensor
             ct_t[i] = torch.from_numpy(ct.hu_a[context_ndx].astype(np.float32))
 
-        # CTs are natively expressed in https://en.wikipedia.org/wiki/Hounsfield_scale
-        # HU are scaled oddly, with 0 g/cc (air, approximately) being -1000 and 1 g/cc (water) being 0.
-        # The lower bound gets rid of negative density stuff used to indicate out-of-FOV
-        # The upper bound nukes any weird hotspots and clamps bone down
+        # In the Hounsfield Unit (HU) scale, air (approximately 0 g/cc) corresponds to -1000 HU,
+        # while water (approximately 1 g/cc) corresponds to 0 HU.
+        # Applying the lower bound removes extreme negative values that typically represent regions
+        # outside the field of view (FOV).
+        # Applying the upper bound suppresses abnormally high intensities, limiting bone density
+        # and eliminating artifacts.
         ct_t.clamp_(-1000, 1000)
 
         pos_t = torch.from_numpy(ct.positive_mask[slice_ndx]).unsqueeze(0)
@@ -325,16 +393,24 @@ class TrainingLuna2dSegmentationDataset(Luna2dSegmentationDataset):
         ct_a, pos_a, center_irc = getCtRawCandidate(
             candidateInfo_tup.series_uid,
             candidateInfo_tup.center_xyz,
-            (7, 96, 96),
+            (7, 96, 96), # Size of the chunk with shape (depth, rows, cols) to extract 
         )
+        
+        # Only slice 3 is the candidate/target slice. For the rest, they're just context slices.
         pos_a = pos_a[3:4]
 
+        # Randomly choose a row and column offset between 0 and 31.
+        # They will be used to crop a 64×64 patch starting from them.
         row_offset = random.randrange(0,32)
         col_offset = random.randrange(0,32)
-        ct_t = torch.from_numpy(ct_a[:, row_offset:row_offset+64,
-                                     col_offset:col_offset+64]).to(torch.float32)
-        pos_t = torch.from_numpy(pos_a[:, row_offset:row_offset+64,
-                                       col_offset:col_offset+64]).to(torch.long)
+        
+        ct_t = torch.from_numpy(
+            ct_a[:, row_offset:row_offset+64, col_offset:col_offset+64]
+        ).to(torch.float32)
+        
+        pos_t = torch.from_numpy(
+            pos_a[:, row_offset:row_offset+64, col_offset:col_offset+64]
+        ).to(torch.long)
 
         slice_ndx = center_irc.index
 

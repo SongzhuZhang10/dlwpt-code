@@ -132,13 +132,13 @@ class SegmentationTrainingApp:
 
     def initModel(self):
         segmentation_model = UNetWrapper(
-            in_channels=7,
-            n_classes=1,
-            depth=3,
-            wf=4,
-            padding=True,
-            batch_norm=True,
-            up_mode='upconv',
+            in_channels=7, # 3+3 context slices + 1 current slice
+            n_classes=1, # 1 output class indicating whether this voxel is part of a nodule
+            depth=3, # depth of the model. Each downsampling operation adds 1 to the depth.
+            wf=4, # number of filters = 2**wf, which doubles with each downsampling
+            padding=True, # Pad the convolutions so that the output image has the same size as the input
+            batch_norm=True, # Perform batch normalization after each activation function
+            up_mode='upconv', # Set the upsampling function to be an upconvolution layer
         )
 
         augmentation_model = SegmentationAugmentation(**self.augmentation_dict)
@@ -154,6 +154,7 @@ class SegmentationTrainingApp:
         return segmentation_model, augmentation_model
 
     def initOptimizer(self):
+        # Instantiate the Adam optimizer
         return Adam(self.segmentation_model.parameters())
         # return SGD(self.segmentation_model.parameters(), lr=0.001, momentum=0.99)
 
@@ -287,75 +288,120 @@ class SegmentationTrainingApp:
         label_g = label_t.to(self.device, non_blocking=True)
 
         if self.segmentation_model.training and self.augmentation_dict:
+            # Apply random transformations to the data to make training more robust.
+            # The input and label tensors must experience the exact same transformations.
             input_g, label_g = self.augmentation_model(input_g, label_g)
-
+        # Runs the segmentation model
         prediction_g = self.segmentation_model(input_g)
-
+        # Compute the dice loss between prediction and label, which measures the loss caused by false positive.
         diceLoss_g = self.diceLoss(prediction_g, label_g)
+        # Compute the dice loss between true positives and label, which measures the loss caused by false negative.
         fnLoss_g = self.diceLoss(prediction_g * label_g, label_g)
 
+        # Starting index of the current batch inside the whole dataset.
         start_ndx = batch_ndx * batch_size
+        # ending index (exclusive). Note that input_t.size(0) is the same as batch_size
+        # except for the last batch.
         end_ndx = start_ndx + input_t.size(0)
 
         with torch.no_grad():
+            """
+            For binary segmentation task, there's only one channel -> Explicitly take only the first channel of the
+            prediction of all samples in a batch while reserving the dimension.
+            Turn the soft prediction into a hard yes/no prediction (binary mask).
+            """
             predictionBool_g = (prediction_g[:, 0:1]
                                 > classificationThreshold).to(torch.float32)
+            
+            # Compute the 1D metric tensors for each sample in the batch.
+            tp = (     predictionBool_g  *   label_g).sum(dim=[1,2,3]) # True Positives
+            fn = ((1 - predictionBool_g) *   label_g).sum(dim=[1,2,3]) # False Negatives
+            fp = (     predictionBool_g  * (~label_g)).sum(dim=[1,2,3]) # False Positives
 
-            tp = (     predictionBool_g *  label_g).sum(dim=[1,2,3])
-            fn = ((1 - predictionBool_g) *  label_g).sum(dim=[1,2,3])
-            fp = (     predictionBool_g * (~label_g)).sum(dim=[1,2,3])
-
+            # Store batch-level results into the global tensor, which tracks the
+            # results for the entire dataset.
             metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = diceLoss_g
             metrics_g[METRICS_TP_NDX, start_ndx:end_ndx] = tp
             metrics_g[METRICS_FN_NDX, start_ndx:end_ndx] = fn
             metrics_g[METRICS_FP_NDX, start_ndx:end_ndx] = fp
-
+        """
+        Missing a nodule (false negative) is much more dangerous than predicting something extra
+        (false positive). Thus, the model is heavily penalized if it misses true positives by
+        increasing the weight 8 times. This forces the model to prioritize detecting all real
+        nodules even at the cost of some extra false positives. The overall loss is more sensitive
+        to missing the acutal nodule.
+        """
         return diceLoss_g.mean() + fnLoss_g.mean() * 8
 
     def diceLoss(self, prediction_g, label_g, epsilon=1):
-        diceLabel_g = label_g.sum(dim=[1,2,3])
+        # Sum of all label pixels of all channels per sample in batch.
+        diceLabel_g = label_g.sum(dim=[1,2,3]) # Result shape: [batch_size]
+        # Sum of all predicted pixels of all channels per sample in batch.
         dicePrediction_g = prediction_g.sum(dim=[1,2,3])
+        # Element-wise multiplication gives pixel-wise overlap.
+        # Summing gives the count of correctly predicted positive pixels (intersection).
         diceCorrect_g = (prediction_g * label_g).sum(dim=[1,2,3])
-
+        # To avoid problems when we accidentally have neither predictions nor labels, we
+        # add epsilon to both numerator and denominator.
         diceRatio_g = (2 * diceCorrect_g + epsilon) \
             / (dicePrediction_g + diceLabel_g + epsilon)
 
         return 1 - diceRatio_g
 
-
+    # Visualize model predictions in TensorBoard during training and validation
     def logImages(self, epoch_ndx, mode_str, dl):
         self.segmentation_model.eval()
 
+        # Select first 12 CT scan series IDs from the dataset.
         images = sorted(dl.dataset.series_list)[:12]
+        
         for series_ndx, series_uid in enumerate(images):
             ct = getCt(series_uid)
-
+            # Sample 6 evenly spaced slices spanning the full scan
             for slice_ndx in range(6):
+                # This mapping ensures the samples are spread across the entire scan evenly.
                 ct_ndx = slice_ndx * (ct.hu_a.shape[0] - 1) // 5
+                # Retrieve the corresponding CT image tensor and label
                 sample_tup = dl.dataset.getitem_fullSlice(series_uid, ct_ndx)
 
                 ct_t, label_t, series_uid, ct_ndx = sample_tup
 
                 input_g = ct_t.to(self.device).unsqueeze(0)
                 label_g = pos_g = label_t.to(self.device).unsqueeze(0)
-
+                # Extract one prediction map from the batch while reducing the dim from 4 to 3.
                 prediction_g = self.segmentation_model(input_g)[0]
+                # Convert the model's output into a 2D binary prediction mask in form of a NumPy array.
+                # Keep the channel dim for overlaying predictions and ground-truth labels on CT images later.
                 prediction_a = prediction_g.to('cpu').detach().numpy()[0] > 0.5
+                # Remove batch and channel dims since it's only needed as a 2D mask overlay.
                 label_a = label_g.cpu().numpy()[0][0] > 0.5
 
+                # Map Hounsfield units with range [–1000…+1000]->[–0.5…+0.5]->[0…1] for all channels except the last one.
                 ct_t[:-1,:,:] /= 2000
                 ct_t[:-1,:,:] += 0.5
 
+                # Extract the 2D middle slice from a 3D tensor and convert it into a NumPy array
+                # so that it can be used in visualization functions of TensorBoard.
                 ctSlice_a = ct_t[dl.dataset.contextSlices_count].numpy()
 
                 image_a = np.zeros((512, 512, 3), dtype=np.float32)
+                # Broadcast single channel NP array into all channels of the image array.
                 image_a[:,:,:] = ctSlice_a.reshape((512,512,1))
+                
+                 # Add false positive mask overlay on existing Red channel map, creating visual highlight.
                 image_a[:,:,0] += prediction_a & (1 - label_a)
-                image_a[:,:,0] += (1 - prediction_a) & label_a
+                
+                # Add false negative mask overlay on both Red and half-green channel maps, creating orange visual highlight
+                image_a[:,:,0] += (1 - prediction_a) & label_a #
                 image_a[:,:,1] += ((1 - prediction_a) & label_a) * 0.5
 
+                # Add true positive mask overlay on existing Green channel map
                 image_a[:,:,1] += prediction_a & label_a
+
+                # Dim the brightness to avoid oversaturation
                 image_a *= 0.5
+                # Clamp all values in the array to the range [0, 1] in-place because TensorBoard
+                # APIs expects pixel values in range [0, 1] for floating-point images.
                 image_a.clip(0, 1, image_a)
 
                 writer = getattr(self, mode_str + '_writer')
@@ -386,8 +432,8 @@ class SegmentationTrainingApp:
                         self.totalTrainingSamples_count,
                         dataformats='HWC',
                     )
-                # This flush prevents TB from getting confused about which
-                # data item belongs where.
+                # Force the TensorBoard to write all pending data to disk immediately.
+                # This flush prevents TB from getting confused about which data item belongs where.
                 writer.flush()
 
     def logMetrics(self, epoch_ndx, mode_str, metrics_t):

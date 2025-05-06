@@ -66,38 +66,56 @@ class SegmentationAugmentation(nn.Module):
         self.noise = noise
 
     def forward(self, input_g, label_g):
+        # Create a random transformation matrix (rotation, flip, scale, offset)
         transform_t = self._build2dTransformMatrix()
+        
+        # Expand the tensor to match the batch size.
         transform_t = transform_t.expand(input_g.shape[0], -1, -1)
+        
+        # Move the transform tensor/matrix to the same device as input_g (CPU or GPU).
         transform_t = transform_t.to(input_g.device, torch.float32)
-        affine_t = F.affine_grid(transform_t[:,:2],
-                input_g.size(), align_corners=False)
+        
+        # Generate a sampling grid based on the 2×3 affine transform.
+        affine_t = F.affine_grid(transform_t[:,:2], input_g.size(), align_corners=False)
 
-        augmented_input_g = F.grid_sample(input_g,
-                affine_t, padding_mode='border',
-                align_corners=False)
-        augmented_label_g = F.grid_sample(label_g.to(torch.float32),
-                affine_t, padding_mode='border',
-                align_corners=False)
+        # Warp the input tensor using the affine grid
+        augmented_input_g = F.grid_sample(input_g, affine_t, padding_mode='border', align_corners=False)
+
+        # Warp the label tensor using the same affine grid
+        # Note that the augmented version of the label may contain pixel values between 0 and 1 due to interpolation.
+        augmented_label_g = F.grid_sample(label_g.to(torch.float32), affine_t, padding_mode='border', align_corners=False)
 
         if self.noise:
+            # Create a new random tensor that has the same shape, same device, and same data type as the input tensor
             noise_t = torch.randn_like(augmented_input_g)
+            # Set the strength of the noise by multiplying each element in noise_t by a constant.
             noise_t *= self.noise
-
+            # Add the noise tensor element-wise to the input tensor
             augmented_input_g += noise_t
 
+        # Return model input and ground-truth target
+        # Restore the label back to a binary mask by thresholding at 0.5.
         return augmented_input_g, augmented_label_g > 0.5
 
     def _build2dTransformMatrix(self):
+        # Creates a 3 × 3 identity matrix.
         transform_t = torch.eye(3)
 
         for i in range(2):
             if self.flip:
+                # 50% chance of flipping along x-/y-axis
                 if random.random() > 0.5:
                     transform_t[i,i] *= -1
 
+            """
+            The maxtrix to be transformed by the this transform matrix should conform 
+            to row vector convention. This means that only the bottom row stores the
+            translation.
+            """
             if self.offset:
                 offset_float = self.offset
                 random_float = (random.random() * 2 - 1)
+                # Translation is in the bottom row.
                 transform_t[2,i] = offset_float * random_float
 
             if self.scale:
@@ -106,15 +124,18 @@ class SegmentationAugmentation(nn.Module):
                 transform_t[i,i] *= 1.0 + scale_float * random_float
 
         if self.rotate:
+            # Takes a random angle in radians, so in the range 0 .. 2{pi}
             angle_rad = random.random() * math.pi * 2
             s = math.sin(angle_rad)
             c = math.cos(angle_rad)
 
+            # Rotation matrix for the 2D rotation by the random angle
             rotation_t = torch.tensor([
                 [c, -s, 0],
                 [s, c, 0],
                 [0, 0, 1]])
 
+            # Apply the rotation to the transformation matrix using matrix multiplication
             transform_t @= rotation_t
 
         return transform_t

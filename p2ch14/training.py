@@ -30,7 +30,7 @@ log.setLevel(logging.DEBUG)
 # Used for computeBatchLoss and logMetrics to index into metrics_t/metrics_a
 METRICS_LABEL_NDX=0
 METRICS_PRED_NDX=1
-METRICS_PRED_P_NDX=2
+METRICS_PRED_P_NDX=2 # index that carries the prediction probabilities (rather than prethresholded predictions)
 METRICS_LOSS_NDX=3
 METRICS_SIZE = 4
 
@@ -124,18 +124,28 @@ class ClassificationTrainingApp:
             d = torch.load(self.cli_args.finetune, map_location='cpu')
             model_blocks = [
                 n for n, subm in model.named_children()
+                # Filters out top-level modules that have parameters (as opposed to the final activation)
                 if len(list(subm.parameters())) > 0
             ]
+            # Takes the last finetune_depth blocks. The default (if fine-tuning) is 1.
             finetune_blocks = model_blocks[-self.cli_args.finetune_depth:]
             log.info(f"finetuning from {self.cli_args.finetune}, blocks {' '.join(finetune_blocks)}")
             model.load_state_dict(
                 {
                     k: v for k,v in d['model_state'].items()
+                    """
+                    Filters out the last block (the final linear part) and does not load it.
+                    Starting from a fully initialized model would have us begin with (almost)
+                    all nodules labeled as malignant, because that output means “nodule” in the
+                    classifier we start from.
+                    """
                     if k.split('.')[0] not in model_blocks[-1]
                 },
+                # Passing strict=False lets us load only some weights of the module (with the filtered ones missing).
                 strict=False,
             )
             for n, p in model.named_parameters():
+                # For all but finetune_blocks, we do not want gradients.
                 if n.split('.')[0] not in finetune_blocks:
                     p.requires_grad_(False)
         if self.use_cuda:

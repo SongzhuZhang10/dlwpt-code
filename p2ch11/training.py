@@ -30,6 +30,7 @@ METRICS_SIZE = 3
 
 class LunaTrainingApp:
     def __init__(self, sys_argv=None):
+        # If the caller doesn’t provide arguments, we get them from the command line.
         if sys_argv is None:
             sys_argv = sys.argv[1:]
 
@@ -61,6 +62,7 @@ class LunaTrainingApp:
             default='dwlpt',
         )
         self.cli_args = parser.parse_args(sys_argv)
+        # We’ll use the timestamp to help identify training runs.
         self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H.%M.%S')
 
         self.trn_writer = None
@@ -164,18 +166,23 @@ class LunaTrainingApp:
 
     def doTraining(self, epoch_ndx, train_dl):
         self.model.train()
+
+        # Create a tensor filled with zeros to store metrics for every training sample.
         trnMetrics_g = torch.zeros(
             METRICS_SIZE,
             len(train_dl.dataset),
             device=self.device,
         )
 
+        # Set up a loop to go through the training data in batches. It also estimates how
+        # long the epoch will take.
         batch_iter = enumerateWithEstimate(
             train_dl,
             "E{} Training".format(epoch_ndx),
             start_ndx=train_dl.num_workers,
         )
         for batch_ndx, batch_tup in batch_iter:
+            # Clear out any old gradients stored in the optimizer.
             self.optimizer.zero_grad()
 
             loss_var = self.computeBatchLoss(
@@ -185,7 +192,11 @@ class LunaTrainingApp:
                 trnMetrics_g
             )
 
+            # Determine how much each model weight contributed to the loss and
+            # calculate gradients for them.
             loss_var.backward()
+
+            # Adjust the model’s weights using the gradients computed in the last step.
             self.optimizer.step()
 
             # # This is for adding the model graph to TensorBoard.
@@ -197,6 +208,8 @@ class LunaTrainingApp:
 
         self.totalTrainingSamples_count += len(train_dl.dataset)
 
+        # Move the metrics tensor from the device (e.g., GPU) to the CPU and returns
+		# it because the CPU is better for post-processing.
         return trnMetrics_g.to('cpu')
 
 
@@ -204,8 +217,8 @@ class LunaTrainingApp:
         with torch.no_grad():
             self.model.eval()
             valMetrics_g = torch.zeros(
-                METRICS_SIZE,
-                len(val_dl.dataset),
+                METRICS_SIZE,         # = 3 → rows: label, prediction, loss
+                len(val_dl.dataset),  # = total number of samples in dataset
                 device=self.device,
             )
 
@@ -221,7 +234,8 @@ class LunaTrainingApp:
         return valMetrics_g.to('cpu')
 
 
-
+    # Compute the loss over a batch of samples and record
+    # per-sample information about model outputs.
     def computeBatchLoss(self, batch_ndx, batch_tup, batch_size, metrics_g):
         input_t, label_t, _series_list, _center_list = batch_tup
 
@@ -230,21 +244,39 @@ class LunaTrainingApp:
 
         logits_g, probability_g = self.model(input_g)
 
+        # reduction=‘none’ gives the loss per sample.
+        # loss_func is an instance of the torch.nn.CrossEntropyLoss class.
         loss_func = nn.CrossEntropyLoss(reduction='none')
         loss_g = loss_func(
             logits_g,
-            label_g[:,1],
+            # Select the second column for all rows, which contains the ground-truth class for each sample.
+            label_g[:,1], # Contains samples' ground-truth class index
         )
+
+        """
+        batch_size is a configuration setting (fixed hardcoded value). It's equal to label_t.size(0)
+        except for the the last batch if the dataset size isn’t perfectly divisible by batch_size.
+        To account for this possibility, label_t.size(0) is used to calculate the end index because
+        label_t.size(0) is a runtime value that adapts to the actual data in each batch.
+        """
         start_ndx = batch_ndx * batch_size
         end_ndx = start_ndx + label_t.size(0)
 
-        metrics_g[METRICS_LABEL_NDX, start_ndx:end_ndx] = \
-            label_g[:,1].detach()
-        metrics_g[METRICS_PRED_NDX, start_ndx:end_ndx] = \
-            probability_g[:,1].detach()
-        metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = \
-            loss_g.detach()
+        """
+        We use detach since none of our metrics need to hold on to gradients.
+        metrics_g: A 2D tensor with rows for different metrics (e.g., labels, predictions) and columns for
+        all samples in the dataset. It has shape [3, batch_size].
+        metrics_g[METRICS_LABEL_NDX, start_ndx:end_ndx] has shape [batch_size], which is the same as label_g[:,1].
+        
+        METRICS_LABEL_NDX: Row index (set to 0) for true labels.
+        """
+        
+        metrics_g[METRICS_LABEL_NDX, start_ndx:end_ndx] = label_g[:,1].detach()
+        metrics_g[METRICS_PRED_NDX, start_ndx:end_ndx] = probability_g[:,1].detach()
+        metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = loss_g.detach()
 
+        # Recombine the loss per sample into a single value
+        # Batch loss is defined as the mean of all per-sample losses in a batch.
         return loss_g.mean()
 
 
@@ -261,7 +293,18 @@ class LunaTrainingApp:
             type(self).__name__,
         ))
 
+        """
+        metrics_t[METRICS_LABEL_NDX] represents the true class for each of the N samples.
+        This mask selects all samples whose true label is negative.
+        It returns a boolean tensor like [True, False, True, ...], where each True marks
+        a ground truth negative sample.
+        """
         negLabel_mask = metrics_t[METRICS_LABEL_NDX] <= classificationThreshold
+
+        """
+        This mask selects all samples the model predicted to be negative.
+        It returns a boolean tensor, where True means the model predicted class 0 (non-nodule).
+        """
         negPred_mask = metrics_t[METRICS_PRED_NDX] <= classificationThreshold
 
         posLabel_mask = ~negLabel_mask
@@ -270,6 +313,12 @@ class LunaTrainingApp:
         neg_count = int(negLabel_mask.sum())
         pos_count = int(posLabel_mask.sum())
 
+        """
+        neg_correct is the number of negative samples that the model correctly predicted as negative.
+        The element in the tensor returned by (negLabel_mask & negPred_mask) is True only where both
+        the sample is actually negative and the model predicted negative. Thus, neg_correct represents
+        the number of negative samples the model predicted correctly.
+        """
         neg_correct = int((negLabel_mask & negPred_mask).sum())
         pos_correct = int((posLabel_mask & posPred_mask).sum())
 
@@ -281,8 +330,10 @@ class LunaTrainingApp:
         metrics_dict['loss/pos'] = \
             metrics_t[METRICS_LOSS_NDX, posLabel_mask].mean()
 
+        # Compute the overall accuracy using floating point division across all samples.
         metrics_dict['correct/all'] = (pos_correct + neg_correct) \
             / np.float32(metrics_t.shape[1]) * 100
+        
         metrics_dict['correct/neg'] = neg_correct / np.float32(neg_count) * 100
         metrics_dict['correct/pos'] = pos_correct / np.float32(pos_count) * 100
 
