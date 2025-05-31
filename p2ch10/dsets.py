@@ -35,7 +35,7 @@ def getCandidateInfoList(requireOnDisk_bool=True):
     # We construct a set with all series_uids that are present on disk.
     # This will let us use the data, even if we haven't downloaded all of
     # the subsets yet.
-    mhd_list = glob.glob('data-unversioned/part2/luna/subset*/*.mhd')
+    mhd_list = glob.glob('F:/Organized_LUNA16_Train_Data/subset*/*.mhd')
     presentOnDisk_set = {os.path.split(p)[-1][:-4] for p in mhd_list}
 
     diameter_dict = {}
@@ -91,7 +91,7 @@ class Ct:
     def __init__(self, series_uid):
         mhd_path = glob.glob(
             # We don’t care to track which subset a given series_uid is in, so we wildcard the subset.
-            'data-unversioned/part2/luna/subset*/{}.mhd'.format(series_uid)
+            'F:/Organized_LUNA16_Train_Data/subset*/{}.mhd'.format(series_uid)
         )[0]
 
         # sitk.ReadImage implicitly consumes the .raw file in addition to the passed-in .mhd file.

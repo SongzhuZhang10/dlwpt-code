@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use('nbagg')
+#matplotlib.use('nbagg')
 
 import numpy as np
 import matplotlib.pyplot as plt

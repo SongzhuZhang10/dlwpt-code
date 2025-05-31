@@ -17,7 +17,7 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader
 
 from util.util import enumerateWithEstimate
-from .dsets import Luna2dSegmentationDataset, TrainingLuna2dSegmentationDataset, getCt
+from .dsets import LunaSliceSegDataset, LunaPatchSegDataset, getCt
 from util.logconf import logging
 from .model import UNetWrapper, SegmentationAugmentation
 
@@ -26,7 +26,6 @@ log = logging.getLogger(__name__)
 # log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 
-# Used for computeClassificationLoss and logMetrics to index into metrics_t/metrics_a
 # METRICS_LABEL_NDX = 0
 METRICS_LOSS_NDX = 1
 # METRICS_FN_LOSS_NDX = 2
@@ -47,62 +46,79 @@ class SegmentationTrainingApp:
             sys_argv = sys.argv[1:]
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--batch-size',
+        parser.add_argument(
+            '--batch-size',
             help='Batch size to use for training',
             default=16,
             type=int,
         )
-        parser.add_argument('--num-workers',
+        parser.add_argument(
+            '--num-workers',
             help='Number of worker processes for background data loading',
             default=8,
             type=int,
         )
-        parser.add_argument('--epochs',
+        parser.add_argument(
+            '--epochs',
             help='Number of epochs to train for',
             default=1,
             type=int,
         )
 
-        parser.add_argument('--augmented',
+        parser.add_argument(
+            '--augmented',
             help="Augment the training data.",
             action='store_true',
             default=False,
         )
-        parser.add_argument('--augment-flip',
+        parser.add_argument(
+            '--augment-flip',
             help="Augment the training data by randomly flipping the data left-right, up-down, and front-back.",
             action='store_true',
             default=False,
         )
-        parser.add_argument('--augment-offset',
+        parser.add_argument(
+            '--augment-offset',
             help="Augment the training data by randomly offsetting the data slightly along the X and Y axes.",
             action='store_true',
             default=False,
         )
-        parser.add_argument('--augment-scale',
+        parser.add_argument(
+            '--augment-scale',
             help="Augment the training data by randomly increasing or decreasing the size of the candidate.",
             action='store_true',
             default=False,
         )
-        parser.add_argument('--augment-rotate',
+        parser.add_argument(
+            '--augment-rotate',
             help="Augment the training data by randomly rotating the data around the head-foot axis.",
             action='store_true',
             default=False,
         )
-        parser.add_argument('--augment-noise',
+        parser.add_argument(
+            '--augment-noise',
             help="Augment the training data by randomly adding noise to the data.",
             action='store_true',
             default=False,
         )
 
-        parser.add_argument('--tb-prefix',
-            default='p2ch13',
+        parser.add_argument(
+            '--tb-prefix',
+            default='p2ch13', # TODO: Better name!
             help="Data prefix to use for Tensorboard run. Defaults to chapter.",
         )
 
-        parser.add_argument('comment',
+        parser.add_argument(
+            'comment',
             help="Comment suffix for Tensorboard run.",
             nargs='?',
             default='none',
+        )
+
+        parser.add_argument(
+            '--resume-from',
+            default='',
+            help='Path to a checkpoint produced by saveModel; training resumes from it.'
         )
 
         self.cli_args = parser.parse_args(sys_argv)
@@ -128,6 +144,31 @@ class SegmentationTrainingApp:
 
         self.segmentation_model, self.augmentation_model = self.initModel()
         self.optimizer = self.initOptimizer()
+        
+        self.start_epoch = 1
+        if self.cli_args.resume_from:
+            if not os.path.exists(self.cli_args.resume_from):
+                log.error(f"Checkpoint not found: {self.cli_args.resume_from}")
+                sys.exit(1)
+            self.start_epoch = self._restore_from_checkpoint(self.cli_args.resume_from)
+
+
+    def _restore_from_checkpoint(self, ckpt_path: str) -> int:
+        log.info(f"Resuming training from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+
+        # ---------- model ----------
+        model = self.model
+        if isinstance(model, torch.nn.DataParallel):
+            model = model.module          # unwrap if needed
+        model.load_state_dict(ckpt['model_state'])
+
+        # ---------- optimizer ----------
+        self.optimizer.load_state_dict(ckpt['optimizer_state'])
+
+        # ---------- bookkeeping ----------
+        self.totalTrainingSamples_count = ckpt.get('totalTrainingSamples_count', 0)
+        return ckpt.get('epoch', 0) + 1   # next epoch index
 
 
     def initModel(self):
@@ -160,7 +201,7 @@ class SegmentationTrainingApp:
 
 
     def initTrainDl(self):
-        train_ds = TrainingLuna2dSegmentationDataset(
+        train_ds = LunaPatchSegDataset(
             val_stride=10,
             isValSet_bool=False,
             contextSlices_count=3,
@@ -180,7 +221,7 @@ class SegmentationTrainingApp:
         return train_dl
 
     def initValDl(self):
-        val_ds = Luna2dSegmentationDataset(
+        val_ds = LunaSliceSegDataset(
             val_stride=10,
             isValSet_bool=True,
             contextSlices_count=3,
@@ -215,22 +256,28 @@ class SegmentationTrainingApp:
         val_dl = self.initValDl()
 
         best_score = 0.0
-        self.validation_cadence = 5
-        for epoch_ndx in range(1, self.cli_args.epochs + 1):
-            log.info("Epoch {} of {}, {}/{} batches of size {}*{}".format(
-                epoch_ndx,
-                self.cli_args.epochs,
-                len(train_dl),
-                len(val_dl),
-                self.cli_args.batch_size,
-                (torch.cuda.device_count() if self.use_cuda else 1),
-            ))
+        
+        # This variable controls how many epochs to wait before doing validation again.
+        self.validation_cadence = 1
+        
+        end_epoch = self.start_epoch + self.cli_args.epochs - 1
+        
+        for epoch_ndx in range(self.start_epoch, self.cli_args.epochs + 1):
+
+            total_gpus = torch.cuda.device_count() if self.use_cuda else 1
+            log.info(
+                f"Epoch {epoch_ndx}/{self.cli_args.epochs} — "
+                f"Training: {len(train_dl)} batches/epoch | "
+                f"Validation: {len(val_dl)} batches/epoch | "
+                f"Batch size: {self.cli_args.batch_size} samples/GPU x "
+                f"{total_gpus} GPUs"
+            )
 
             trnMetrics_t = self.doTraining(epoch_ndx, train_dl)
-            self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
+            #self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
 
+            #  Epochs start at 1. Validation always runs on the first epoch.
             if epoch_ndx == 1 or epoch_ndx % self.validation_cadence == 0:
-                # if validation is wanted
                 valMetrics_t = self.doValidation(epoch_ndx, val_dl)
                 score = self.logMetrics(epoch_ndx, 'val', valMetrics_t)
                 best_score = max(score, best_score)
@@ -254,13 +301,15 @@ class SegmentationTrainingApp:
             start_ndx=train_dl.num_workers,
         )
         for batch_ndx, batch_tup in batch_iter:
-            self.optimizer.zero_grad()
-
+            self.optimizer.zero_grad() # Clear gradients from previous batch
+            # Perform a forward pass through the model and return the loss tensor
             loss_var = self.computeBatchLoss(batch_ndx, batch_tup, train_dl.batch_size, trnMetrics_g)
+            # Compute the gradients of the loss tensor with respect to all model parameters using backpropagation.
             loss_var.backward()
-
+            # Update the model's parameters based on the gradients by appling the learning rule (e.g., Adam)
+            # to move the model weights in the direction that reduces the loss.
             self.optimizer.step()
-
+        # trnMetrics_g is of shape (METRICS_SIZE, dataset_size).
         self.totalTrainingSamples_count += trnMetrics_g.size(1)
 
         return trnMetrics_g.to('cpu')
@@ -291,11 +340,15 @@ class SegmentationTrainingApp:
             # Apply random transformations to the data to make training more robust.
             # The input and label tensors must experience the exact same transformations.
             input_g, label_g = self.augmentation_model(input_g, label_g)
+
         # Runs the segmentation model
+        # input_g shape = [batch_size, 7, 64, 64]
+        # prediction_g shape = [batch_size, 1, 64, 64]
         prediction_g = self.segmentation_model(input_g)
-        # Compute the dice loss between prediction and label, which measures the loss caused by false positive.
+        # Compute the dice loss between predicted positives and label, which measures the loss caused by false positive.
         diceLoss_g = self.diceLoss(prediction_g, label_g)
         # Compute the dice loss between true positives and label, which measures the loss caused by false negative.
+        # This loss cares only about how many ground-truth positives were missed (i.e., false negatives).
         fnLoss_g = self.diceLoss(prediction_g * label_g, label_g)
 
         # Starting index of the current batch inside the whole dataset.
@@ -310,8 +363,7 @@ class SegmentationTrainingApp:
             prediction of all samples in a batch while reserving the dimension.
             Turn the soft prediction into a hard yes/no prediction (binary mask).
             """
-            predictionBool_g = (prediction_g[:, 0:1]
-                                > classificationThreshold).to(torch.float32)
+            predictionBool_g = (prediction_g[:, 0:1] > classificationThreshold).to(torch.float32)
             
             # Compute the 1D metric tensors for each sample in the batch.
             tp = (     predictionBool_g  *   label_g).sum(dim=[1,2,3]) # True Positives
@@ -343,8 +395,7 @@ class SegmentationTrainingApp:
         diceCorrect_g = (prediction_g * label_g).sum(dim=[1,2,3])
         # To avoid problems when we accidentally have neither predictions nor labels, we
         # add epsilon to both numerator and denominator.
-        diceRatio_g = (2 * diceCorrect_g + epsilon) \
-            / (dicePrediction_g + diceLabel_g + epsilon)
+        diceRatio_g = (2 * diceCorrect_g + epsilon) / (dicePrediction_g + diceLabel_g + epsilon)
 
         return 1 - diceRatio_g
 
@@ -360,6 +411,7 @@ class SegmentationTrainingApp:
             # Sample 6 evenly spaced slices spanning the full scan
             for slice_ndx in range(6):
                 # This mapping ensures the samples are spread across the entire scan evenly.
+                # hu_a is of shape (depth, height, width)
                 ct_ndx = slice_ndx * (ct.hu_a.shape[0] - 1) // 5
                 # Retrieve the corresponding CT image tensor and label
                 sample_tup = dl.dataset.getitem_fullSlice(series_uid, ct_ndx)
@@ -367,10 +419,10 @@ class SegmentationTrainingApp:
                 ct_t, label_t, series_uid, ct_ndx = sample_tup
 
                 input_g = ct_t.to(self.device).unsqueeze(0)
-                label_g = pos_g = label_t.to(self.device).unsqueeze(0)
+                label_g = label_t.to(self.device).unsqueeze(0)
                 # Extract one prediction map from the batch while reducing the dim from 4 to 3.
-                prediction_g = self.segmentation_model(input_g)[0]
-                # Convert the model's output into a 2D binary prediction mask in form of a NumPy array.
+                prediction_g = self.segmentation_model(input_g)[0] # The model returns a 4D tensor.
+                # [0] removes the batch dimension.
                 # Keep the channel dim for overlaying predictions and ground-truth labels on CT images later.
                 prediction_a = prediction_g.to('cpu').detach().numpy()[0] > 0.5
                 # Remove batch and channel dims since it's only needed as a 2D mask overlay.
@@ -392,7 +444,7 @@ class SegmentationTrainingApp:
                 image_a[:,:,0] += prediction_a & (1 - label_a)
                 
                 # Add false negative mask overlay on both Red and half-green channel maps, creating orange visual highlight
-                image_a[:,:,0] += (1 - prediction_a) & label_a #
+                image_a[:,:,0] += (1 - prediction_a) & label_a
                 image_a[:,:,1] += ((1 - prediction_a) & label_a) * 0.5
 
                 # Add true positive mask overlay on existing Green channel map
@@ -487,6 +539,9 @@ class SegmentationTrainingApp:
         ))
 
         self.initTensorboardWriters()
+
+        # If mode_str = 'trn' → writer = self.trn_writer
+        # If mode_str = 'val' → writer = self.val_writer
         writer = getattr(self, mode_str + '_writer')
 
         prefix_str = 'seg_'
@@ -500,57 +555,42 @@ class SegmentationTrainingApp:
 
         return score
 
-    # def logModelMetrics(self, model):
-    #     writer = getattr(self, 'trn_writer')
-    #
-    #     model = getattr(model, 'module', model)
-    #
-    #     for name, param in model.named_parameters():
-    #         if param.requires_grad:
-    #             min_data = float(param.data.min())
-    #             max_data = float(param.data.max())
-    #             max_extent = max(abs(min_data), abs(max_data))
-    #
-    #             # bins = [x/50*max_extent for x in range(-50, 51)]
-    #
-    #             writer.add_histogram(
-    #                 name.rsplit('.', 1)[-1] + '/' + name,
-    #                 param.data.cpu().numpy(),
-    #                 # metrics_a[METRICS_PRED_NDX, negHist_mask],
-    #                 self.totalTrainingSamples_count,
-    #                 # bins=bins,
-    #             )
-    #
-    #             # print name, param.data
-
+    """
+    Save the segmentation model for this epoch. If it performed better than all previous
+    ones on the validation set, also save it as the best model checkpoint.
+    
+    type_str: A string used to name the model file.
+    """
     def saveModel(self, type_str, epoch_ndx, isBest=False):
         file_path = os.path.join(
-            'data-unversioned',
-            'part2',
+            'data-unversioned', # TODO: Choose a better folder name
+            'part2', # TODO: Better name
             'models',
             self.cli_args.tb_prefix,
-            '{}_{}_{}.{}.state'.format(
+            '{}_{}_e{:02d}_{}.state'.format(
                 type_str,
                 self.time_str,
-                self.cli_args.comment,
+                epoch_ndx,
                 self.totalTrainingSamples_count,
             )
         )
-
+        # Extract the directory portion from a full file path. Then Recursively creates all
+        # directories in the given path if they don’t exist yet.
+        # exist_ok=True	-> If the directory already exists, do not raise an error.
         os.makedirs(os.path.dirname(file_path), mode=0o755, exist_ok=True)
 
         model = self.segmentation_model
+        # Check if model is using multiple GPUs
         if isinstance(model, torch.nn.DataParallel):
+            # Extract the unwrapped model inside DataParallel
             model = model.module
 
         state = {
-            'sys_argv': sys.argv,
-            'time': str(datetime.datetime.now()),
-            'model_state': model.state_dict(),
+            'model_state': model.state_dict(), # All weights of the neural network
             'model_name': type(model).__name__,
-            'optimizer_state' : self.optimizer.state_dict(),
+            'optimizer_state' : self.optimizer.state_dict(), # 	Momentum, learning rate, etc.
             'optimizer_name': type(self.optimizer).__name__,
-            'epoch': epoch_ndx,
+            'epoch': epoch_ndx, # Last completed epoch (for resuming training)
             'totalTrainingSamples_count': self.totalTrainingSamples_count,
         }
         torch.save(state, file_path)
@@ -559,14 +599,26 @@ class SegmentationTrainingApp:
 
         if isBest:
             best_path = os.path.join(
-                'data-unversioned', 'part2', 'models',
+                'data-unversioned',
+                'part2',
+                'models', # TODO: Naming
                 self.cli_args.tb_prefix,
-                f'{type_str}_{self.time_str}_{self.cli_args.comment}.best.state')
+                '{}_{}_e{:02d}_{}_{}.state'.format(
+                    type_str,
+                    self.time_str,
+                    epoch_ndx,
+                    self.totalTrainingSamples_count,
+                    'best',
+                )
+            )
             shutil.copyfile(file_path, best_path)
 
             log.info("Saved model params to {}".format(best_path))
 
+        # Open the save model file in (r)ead (b)inary mode.
         with open(file_path, 'rb') as f:
+            # Log a SHA-1 hash fingerprint of the saved model file to ensure data integrity,
+            # uniqueness, and traceability
             log.info("SHA1: " + hashlib.sha1(f.read()).hexdigest())
 
 

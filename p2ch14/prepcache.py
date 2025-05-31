@@ -9,9 +9,8 @@ from torch.optim import SGD
 from torch.utils.data import DataLoader
 
 from util.util import enumerateWithEstimate
-from .dsets import LunaDataset, getCtSampleSize
+from .dsets import LunaDataset
 from util.logconf import logging
-# from .model import LunaModel
 
 log = logging.getLogger(__name__)
 # log.setLevel(logging.WARN)
@@ -36,11 +35,6 @@ class LunaPrepCacheApp:
             default=8,
             type=int,
         )
-        # parser.add_argument('--scaled',
-        #     help="Scale the CT chunks to square voxels.",
-        #     default=False,
-        #     action='store_true',
-        # )
 
         self.cli_args = parser.parse_args(sys_argv)
 

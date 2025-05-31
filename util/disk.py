@@ -1,7 +1,10 @@
 import gzip
 
 from diskcache import FanoutCache, Disk
-from diskcache.core import BytesType, MODE_BINARY, BytesIO
+
+from io import BytesIO
+MODE_BINARY = 'binary'  # use this or whatever your code expects
+BytesType = bytes       # use standard `bytes` type
 
 from util.logconf import logging
 log = logging.getLogger(__name__)

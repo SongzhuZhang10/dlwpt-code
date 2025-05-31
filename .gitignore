@@ -1,3 +1,13 @@
 .DS_Store
 tools
 *_old
+data/p1ch2/mnist
+data-unversioned
+data/p1ch2/zebra.jpg
+*.pyc
+p2ch13/.ipynb_checkpoints
+roc_diameter_baseline.png
+roc_finetune.png
+roc_modified.png
+runs
+logs
